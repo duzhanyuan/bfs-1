@@ -37,11 +37,8 @@ void print_usage() {
     printf("\t    put <localfile> <bfsfile> : copy file from local to bfs\n");
     printf("\t    rmdir <path> : remove empty directory\n");
     printf("\t    rmr <path> : remove directory recursively\n");
-    printf("\t    change_replica_num <bfsfile> <num>: change replica num of <bfsfile> to <num>\n");
     printf("\t    du <path> : count disk usage for path\n");
     printf("\t    stat : list current stat of the file system\n");
-    printf("\t    shutdownchunkserver <chunkserver_list_file>: shutdownt chunkservers in the list file\n");
-    printf("\t    shutdownstat : display stat of shutdown chunkserver progress\n");
 }
 
 int BfsMkdir(baidu::bfs::FS* fs, int argc, char* argv[]) {
@@ -269,7 +266,8 @@ int BfsDu(baidu::bfs::FS* fs, int argc, char* argv[]) {
     std::string path = argv[0];
     assert(path.size() > 0);
     if (path[path.size() - 1] != '*') {
-        return BfsDuV2(fs, path);
+        int64_t du_size = BfsDuV2(fs, path);
+        return du_size >= 0 ? 0 : -1;
     }
 
     // Wildcard
@@ -325,9 +323,17 @@ int BfsList(baidu::bfs::FS* fs, int argc, char* argv[]) {
         localtime_r(&ctime, &stm);
         snprintf(timestr, sizeof(timestr), "%4d-%02d-%02d %2d:%02d",
             stm.tm_year+1900, stm.tm_mon+1, stm.tm_mday, stm.tm_hour, stm.tm_min);
+        std::string prefix = path;
+        if (files[i].name[0] == '\0') {
+            int32_t pos = prefix.size() - 1;
+            while (pos >= 0 && prefix[pos] == '/') {
+                pos--;
+            }
+            prefix.resize(pos + 1);
+        }
         printf("%s %-9s %s %s%s\n",
                statbuf, baidu::common::HumanReadableString(files[i].size).c_str(),
-               timestr, path.c_str(), files[i].name);
+               timestr, prefix.c_str(), files[i].name);
     }
     delete[] files;
     return 0;

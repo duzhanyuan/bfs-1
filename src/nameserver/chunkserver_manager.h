@@ -7,6 +7,7 @@
 
 #include <common/thread_pool.h>
 #include "proto/nameserver.pb.h"
+#include "proto/status_code.pb.h"
 
 namespace baidu {
 namespace bfs {
@@ -14,6 +15,7 @@ namespace bfs {
 const double kChunkServerLoadMax = 0.999999;
 
 class BlockMappingManager;
+typedef  std::vector<std::pair<int64_t, std::vector<std::string> > > RecoverVec;
 
 class ChunkServerManager {
 public:
@@ -25,7 +27,7 @@ public:
         int64_t recover_speed;
     };
     ChunkServerManager(ThreadPool* thread_pool, BlockMappingManager* block_mapping_manager);
-    void HandleRegister(const std::string& ip,
+    bool HandleRegister(const std::string& ip,
                         const RegisterRequest* request,
                         RegisterResponse* response);
     void HandleHeartBeat(const HeartBeatRequest* request, HeartBeatResponse* response);
@@ -40,22 +42,23 @@ public:
     bool RemoveChunkServer(const std::string& address);
     std::string GetChunkServerAddr(int32_t id);
     int32_t GetChunkServerId(const std::string& address);
-    void AddBlock(int32_t id, int64_t block_id);
+    void AddBlock(int32_t id, int64_t block_id, bool is_recover);
     void RemoveBlock(int32_t id, int64_t block_id);
     void CleanChunkServer(ChunkServerInfo* cs, const std::string& reason);
-    void PickRecoverBlocks(int cs_id,
-                           std::vector<std::pair<int64_t, std::vector<std::string> > >* recover_blocks,
-                           int* hi_num);
+    void PickRecoverBlocks(int cs_id,  RecoverVec* recover_blocks, int* hi_num, bool hi_only);
     void GetStat(int32_t* w_qps, int64_t* w_speed, int32_t* r_qps,
                  int64_t* r_speed, int64_t* recover_speed);
     StatusCode ShutdownChunkServer(const::google::protobuf::RepeatedPtrField<std::string>& chunkserver_address);
     bool GetShutdownChunkServerStat();
-    void AddBlock(int32_t id, const::google::protobuf::RepeatedPtrField<ReportBlockInfo>& blocks);
+    int64_t AddBlockWithCheck(int32_t id, const std::set<int64_t>& blocks, int64_t start, int64_t end,
+                  std::vector<int64_t>* lost, int64_t report_id);
+    void SetParam(const Params& p);
 private:
     struct ChunkServerBlockMap {
         Mutex* mu;
         std::set<int64_t> blocks;
-        ChunkServerBlockMap() {
+        int64_t report_id;
+        ChunkServerBlockMap() : report_id(-1) {
             mu = new Mutex;
         }
         ~ChunkServerBlockMap() {
@@ -71,7 +74,8 @@ private:
         const std::vector<std::pair<double, ChunkServerInfo*> >& loads,
         std::vector<std::pair<int32_t,std::string> >* chains);
     void MarkChunkServerReadonly(const std::string& chunkserver_address);
-    bool GetChunkServerBlockMapPtr(int32_t cs_id, ChunkServerBlockMap** cs_block_map);
+    bool GetChunkServerBlockMapPtr(const std::map<int32_t, ChunkServerBlockMap*>& src_map,
+                                   int32_t cs_id, ChunkServerBlockMap** cs_block_map);
 private:
     ThreadPool* thread_pool_;
     BlockMappingManager* block_mapping_manager_;
@@ -82,6 +86,7 @@ private:
     std::map<std::string, int32_t> address_map_;
     std::map<int32_t, std::set<ChunkServerInfo*> > heartbeat_list_;
     std::map<int32_t, ChunkServerBlockMap*> chunkserver_block_map_;
+    std::map<int32_t, ChunkServerBlockMap*> chunkserver_block_delta_;
     int32_t chunkserver_num_;
     int32_t next_chunkserver_id_;
 
@@ -89,6 +94,9 @@ private:
     std::string localzone_;
 
     std::vector<std::string> chunkservers_to_offline_;
+
+    // for chunkserver
+    Params params_;
 };
 
 

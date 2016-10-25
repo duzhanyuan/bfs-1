@@ -4,6 +4,9 @@
 
 #include "block_mapping_manager.h"
 
+#include <stdlib.h>
+#include <time.h>
+
 #include <common/counter.h>
 #include <common/string_util.h>
 
@@ -21,6 +24,7 @@ BlockMappingManager::BlockMappingManager(int32_t bucket_num) :
     for (size_t i = 0; i < block_mapping_.size(); i++) {
         block_mapping_[i] = new BlockMapping(thread_pool_);
     }
+    srand(time(NULL));
 }
 
 BlockMappingManager::~BlockMappingManager() {
@@ -59,16 +63,17 @@ bool BlockMappingManager::UpdateBlockInfo(int64_t block_id, int32_t server_id, i
     return block_mapping_[bucket_offset]->UpdateBlockInfo(block_id, server_id, block_size, block_version);
 }
 
-void BlockMappingManager::RemoveBlocksForFile(const FileInfo& file_info) {
+void BlockMappingManager::RemoveBlocksForFile(const FileInfo& file_info,
+                                              std::map<int64_t, std::set<int32_t> >* blocks) {
     for (int i = 0; i < file_info.blocks_size(); i++) {
         int32_t bucket_offset = GetBucketOffset(file_info.blocks(i));
-        block_mapping_[bucket_offset]->RemoveBlocksForFile(file_info);
+        block_mapping_[bucket_offset]->RemoveBlocksForFile(file_info, blocks);
     }
 }
 
 void BlockMappingManager::RemoveBlock(int64_t block_id) {
     int32_t bucket_offset = GetBucketOffset(block_id);
-    block_mapping_[bucket_offset]->RemoveBlock(block_id);
+    block_mapping_[bucket_offset]->RemoveBlock(block_id, NULL);
 }
 
 void BlockMappingManager::DealWithDeadNode(int32_t cs_id, const std::set<int64_t>& blocks) {
@@ -83,6 +88,11 @@ void BlockMappingManager::DealWithDeadNode(int32_t cs_id, const std::set<int64_t
     }
 }
 
+void BlockMappingManager::DealWithDeadBlock(int32_t cs_id, int64_t block_id) {
+    int32_t bucket_offset = GetBucketOffset(block_id);
+    block_mapping_[bucket_offset]->DealWithDeadBlock(cs_id, block_id);
+}
+
 StatusCode BlockMappingManager::CheckBlockVersion(int64_t block_id, int64_t version) {
     int32_t bucket_offset = GetBucketOffset(block_id);
     return block_mapping_[bucket_offset]->CheckBlockVersion(block_id, version);
@@ -90,13 +100,22 @@ StatusCode BlockMappingManager::CheckBlockVersion(int64_t block_id, int64_t vers
 
 void BlockMappingManager::PickRecoverBlocks(int32_t cs_id, int32_t block_num,
                        std::vector<std::pair<int64_t, std::set<int32_t> > >* recover_blocks,
-                       int32_t* hi_num) {
+                       int32_t* hi_num, bool hi_only) {
+    int start_bucket = rand() % blockmapping_bucket_num_;
     for (int i = 0; i < blockmapping_bucket_num_ && (size_t)block_num > recover_blocks->size(); i++) {
-        block_mapping_[i]->PickRecoverBlocks(cs_id, block_num - recover_blocks->size(), recover_blocks, kHigh);
+        block_mapping_[start_bucket % blockmapping_bucket_num_]->
+            PickRecoverBlocks(cs_id, block_num - recover_blocks->size(), recover_blocks, kHigh);
+        ++start_bucket;
     }
     *(hi_num) += recover_blocks->size();
+    if (hi_only) {
+        return;
+    }
+    start_bucket = rand() % blockmapping_bucket_num_;
     for (int i = 0; i < blockmapping_bucket_num_ && (size_t)block_num > recover_blocks->size(); i++) {
-        block_mapping_[i]->PickRecoverBlocks(cs_id, block_num - recover_blocks->size(), recover_blocks, kLow);
+        block_mapping_[start_bucket % blockmapping_bucket_num_]->
+            PickRecoverBlocks(cs_id, block_num - recover_blocks->size(), recover_blocks, kLow);
+        ++start_bucket;
     }
 }
 
@@ -127,12 +146,6 @@ void BlockMappingManager::GetStat(int32_t cs_id, RecoverBlockNum* recover_num) {
 void BlockMappingManager::ListRecover(RecoverBlockSet* recover_blocks) {
     for (size_t i = 0; i < block_mapping_.size(); i++) {
         block_mapping_[i]->ListRecover(recover_blocks);
-    }
-}
-
-void BlockMappingManager::SetSafeMode(bool safe_mode) {
-    for (size_t i = 0; i < block_mapping_.size(); i++) {
-        block_mapping_[i]->SetSafeMode(safe_mode);
     }
 }
 

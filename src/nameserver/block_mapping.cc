@@ -13,7 +13,8 @@
 #include <common/string_util.h>
 
 DECLARE_int32(recover_speed);
-DECLARE_int32(recover_timeout);
+DECLARE_int32(hi_recover_timeout);
+DECLARE_int32(lo_recover_timeout);
 DECLARE_bool(bfs_bug_tolerant);
 DECLARE_bool(clean_redundancy);
 DECLARE_int32(web_recover_list_size);
@@ -34,12 +35,7 @@ NSBlock::NSBlock(int64_t block_id, int32_t replica,
       recover_stat(block_version < 0 ? kBlockWriting : kNotInRecover) {
 }
 
-BlockMapping::BlockMapping(ThreadPool* thread_pool) :
-                           thread_pool_(thread_pool), safe_mode_(true) {}
-
-void BlockMapping::SetSafeMode(bool safe_mode) {
-    safe_mode_ = safe_mode;
-}
+BlockMapping::BlockMapping(ThreadPool* thread_pool) : thread_pool_(thread_pool) {}
 
 bool BlockMapping::GetBlock(int64_t block_id, NSBlock* block) {
     MutexLock lock(&mu_, "BlockMapping::GetBlock", 1000);
@@ -69,7 +65,7 @@ bool BlockMapping::GetLocatedBlock(int64_t id, std::vector<int32_t>* replica, in
                         block->incomplete_replica.begin(),
                         block->incomplete_replica.end());
     }
-    if (!safe_mode_ && replica->empty()) {
+    if (replica->empty()) {
         LOG(DEBUG, "Block #%ld lost all replica", id);
     }
     *size = block->block_size;
@@ -116,9 +112,11 @@ void BlockMapping::AddNewBlock(int64_t block_id, int32_t replica,
     }
     g_blocks_num.Inc();
     MutexLock lock(&mu_);
+    common::timer::TimeChecker insert_time;
     std::pair<NSBlockMap::iterator, bool> ret =
         block_map_.insert(std::make_pair(block_id, nsblock));
     assert(ret.second == true);
+    insert_time.Check(10 * 1000, "[AddNewBlock] InsertToBlockMapping");
 }
 
 bool BlockMapping::UpdateWritingBlock(NSBlock* nsblock,
@@ -149,7 +147,6 @@ bool BlockMapping::UpdateWritingBlock(NSBlock* nsblock,
         LOG(INFO, "Block #%ld C%d has old version V%ld %ld now: V%ld %ld R%lu IR%lu",
             block_id, cs_id, block_version, block_size,
             nsblock->version, nsblock->block_size, replica.size(), inc_replica.size());
-        if (safe_mode_) return true;
         if (replica.empty() && inc_replica.empty()) {
             LOG(WARNING, "Data lost #%ld C%d V%ld %ld -> V%ld %ld",
                 block_id, cs_id, block_version, block_size,
@@ -188,8 +185,7 @@ bool BlockMapping::UpdateWritingBlock(NSBlock* nsblock,
         LOG(INFO, "Writing replica finish #%ld C%d V%ld %ld R%lu IR%lu",
             block_id, cs_id, block_version, block_size, replica.size(), inc_replica.size());
     }
-    if (inc_replica.empty()
-        && (!safe_mode_ || replica.size() >= nsblock->expect_replica_num)) {
+    if (inc_replica.empty() && replica.size() >= nsblock->expect_replica_num) {
         LOG(INFO, "Writing block complete #%ld V%ld %ld R%lu",
             block_id, block_version, block_size, replica.size());
         SetState(nsblock, kNotInRecover);
@@ -211,9 +207,16 @@ bool BlockMapping::UpdateNormalBlock(NSBlock* nsblock,
             if (replica.find(cs_id) != replica.end()) {
                 return true;
             }
-            LOG(WARNING, "Incomplete block #%ld from C%d drop it, now V%ld %ld R%lu",
-                block_id, cs_id, nsblock->version, nsblock->block_size, replica.size());
-            return false;
+            if (replica.size() >= nsblock->expect_replica_num) {
+                LOG(INFO, "Drop incomplete block #%ld from C%d, now V%ld %ld R%lu",
+                    block_id, cs_id, nsblock->version, nsblock->block_size, replica.size());
+                return false;
+            } else {
+                LOG(INFO, "Keep incomplete block #%ld from C%d, now V%ld %ld R%lu IR%lu",
+                    block_id, cs_id, nsblock->version, nsblock->block_size,
+                    replica.size(), inc_replica.size());
+                return true;
+            }
         }
     }
     /// Then block_version >= 0
@@ -228,7 +231,6 @@ bool BlockMapping::UpdateNormalBlock(NSBlock* nsblock,
         LOG(INFO, "Block #%ld C%d has old version V%ld %ld now: V%ld %ld R%lu IR%lu",
             block_id, cs_id, block_version, block_size,
             nsblock->version, nsblock->block_size, replica.size(), inc_replica.size());
-        if (safe_mode_) return true;
         if (replica.empty()) {
             LOG(WARNING, "Data lost #%ld C%d V%ld %ld -> V%ld %ld",
                 block_id, cs_id, block_version, block_size,
@@ -262,10 +264,8 @@ bool BlockMapping::UpdateNormalBlock(NSBlock* nsblock,
             cs_id, block_version, block_size, block_id, replica.size());
     }
 
-    if (!safe_mode_ || replica.size() >= nsblock->expect_replica_num) {
-        TryRecover(nsblock);
-    }
-    if (FLAGS_clean_redundancy && !safe_mode_ && replica.size() > nsblock->expect_replica_num) {
+    TryRecover(nsblock);
+    if (FLAGS_clean_redundancy && replica.size() > nsblock->expect_replica_num) {
         LOG(INFO, "Too much replica #%ld R%lu expect=%d C%d ",
             block_id, replica.size(), nsblock->expect_replica_num, cs_id);
         replica.erase(cs_id);
@@ -307,7 +307,6 @@ bool BlockMapping::UpdateIncompleteBlock(NSBlock* nsblock,
         LOG(INFO, "Block #%ld C%d has old version V%ld %ld now: V%ld %ld R%lu IR%lu",
             block_id, cs_id, block_version, block_size,
             nsblock->version, nsblock->block_size, replica.size(), inc_replica.size());
-        if (safe_mode_) return true;
         if (replica.empty() && inc_replica.empty()) {
             LOG(WARNING, "Data lost #%ld C%d V%ld %ld -> V%ld %ld",
                 block_id, cs_id, block_version, block_size,
@@ -344,8 +343,7 @@ bool BlockMapping::UpdateIncompleteBlock(NSBlock* nsblock,
         LOG(INFO, "Incomplete block replica finish %ld C%d V%ld %ld R%lu IR%lu",
             block_id, cs_id, block_version, block_size, replica.size(), inc_replica.size());
     }
-    if (inc_replica.empty()
-        && (!safe_mode_ || replica.size() >= nsblock->expect_replica_num)) {
+    if (inc_replica.empty()) {
         LOG(INFO, "Incomplete block complete #%ld V%ld %ld R%lu",
             block_id, block_version, block_size, replica.size());
         SetState(nsblock, kNotInRecover);
@@ -458,16 +456,23 @@ bool BlockMapping::UpdateBlockInfoMerge(NSBlock* nsblock,
 bool BlockMapping::UpdateBlockInfo(int64_t block_id, int32_t server_id, int64_t block_size,
                                    int64_t block_version) {
     MutexLock lock(&mu_);
+    common::timer::TimeChecker update_block_timer;
     NSBlock* block = NULL;
     if (!GetBlockPtr(block_id, &block)) {
         LOG(DEBUG, "UpdateBlockInfo C%d #%ld has been removed", server_id, block_id);
         return false;
     }
+    update_block_timer.Check(10 * 1000, "[UpdateBlockInfo] GetBlockPtr");
+    bool ret = true;;
     switch (block->recover_stat) {
       case kBlockWriting:
-        return UpdateWritingBlock(block, server_id, block_size, block_version);
+        ret = UpdateWritingBlock(block, server_id, block_size, block_version);
+        update_block_timer.Check(10 * 1000, "[UpdateBlockInfo] UpdateWritingBlock");
+        return ret;
       case kIncomplete:
-        return UpdateIncompleteBlock(block, server_id, block_size, block_version);
+        ret = UpdateIncompleteBlock(block, server_id, block_size, block_version);
+        update_block_timer.Check(10 * 1000, "[UpdateBlockInfo] UpdateIncomleteBlock");
+        return ret;
       case kLost:
         if (block->version < 0) {
             bool ret = UpdateWritingBlock(block, server_id, block_size, block_version);
@@ -481,27 +486,37 @@ bool BlockMapping::UpdateBlockInfo(int64_t block_id, int32_t server_id, int64_t 
             }
             return ret;
         } else {
-            return UpdateNormalBlock(block, server_id, block_size, block_version);
+            ret = UpdateNormalBlock(block, server_id, block_size, block_version);
+            update_block_timer.Check(10 * 1000, "[UpdateBlockInfo] UpdateNormalBlock");
+            return ret;
         }
       default:  // kNotInRecover kLow kHi kLost kCheck
-        return UpdateNormalBlock(block, server_id, block_size, block_version);
+        ret = UpdateNormalBlock(block, server_id, block_size, block_version);
+        update_block_timer.Check(10 * 1000, "[UpdateBlockInfo] UpdateNormalBlock");
+        return ret;
     }
 }
 
-void BlockMapping::RemoveBlocksForFile(const FileInfo& file_info) {
+void BlockMapping::RemoveBlocksForFile(const FileInfo& file_info,
+                                       std::map<int64_t, std::set<int32_t> >* blocks) {
     for (int i = 0; i < file_info.blocks_size(); i++) {
         int64_t block_id = file_info.blocks(i);
-        RemoveBlock(block_id);
+        RemoveBlock(block_id, blocks);
         LOG(INFO, "Remove block #%ld for %s", block_id, file_info.name().c_str());
     }
 }
 
-void BlockMapping::RemoveBlock(int64_t block_id) {
+void BlockMapping::RemoveBlock(int64_t block_id, std::map<int64_t, std::set<int32_t> >* blocks) {
     MutexLock lock(&mu_);
     NSBlock* block = NULL;
     if (!GetBlockPtr(block_id, &block)) {
         LOG(WARNING, "RemoveBlock #%ld not found", block_id);
         return;
+    }
+    if (blocks) {
+        std::set<int32_t>& block_cs = (*blocks)[block_id];
+        block_cs.insert(block->incomplete_replica.begin(), block->incomplete_replica.end());
+        block_cs.insert(block->replica.begin(), block->replica.end());
     }
     if (block->recover_stat == kIncomplete) {
         for (std::set<int32_t>::iterator it = block->incomplete_replica.begin();
@@ -535,7 +550,7 @@ StatusCode BlockMapping::CheckBlockVersion(int64_t block_id, int64_t version) {
     return kOK;
 }
 
-void BlockMapping::DealWithDeadBlock(int32_t cs_id, int64_t block_id) {
+void BlockMapping::DealWithDeadBlockInternal(int32_t cs_id, int64_t block_id) {
     mu_.AssertHeld();
     NSBlock* block = NULL;
     if (!GetBlockPtr(block_id, &block)) {
@@ -558,7 +573,9 @@ void BlockMapping::DealWithDeadBlock(int32_t cs_id, int64_t block_id) {
     if (block->recover_stat == kIncomplete) {
         LOG(INFO, "Incomplete block C%d #%ld dead replica= %lu",
             cs_id, block_id, replica.size());
-        if (inc_replica.empty() && !safe_mode_) SetState(block, kNotInRecover);
+        if (inc_replica.empty()) {
+            SetState(block, kNotInRecover);
+        }
     } else if (block->recover_stat == kBlockWriting) {
         LOG(INFO, "Writing block C%d #%ld dead R%lu IR%lu",
             cs_id, block_id, replica.size(), inc_replica.size());
@@ -566,9 +583,7 @@ void BlockMapping::DealWithDeadBlock(int32_t cs_id, int64_t block_id) {
             SetState(block, kIncomplete);
             InsertToIncomplete(block_id, inc_replica);
         } else {
-            if (!safe_mode_) {
-                SetState(block, kNotInRecover);
-            }
+            SetState(block, kNotInRecover);
         }
     }   // else Normal check low hi
 
@@ -580,7 +595,7 @@ void BlockMapping::DealWithDeadBlock(int32_t cs_id, int64_t block_id) {
 void BlockMapping::DealWithDeadNode(int32_t cs_id, const std::set<int64_t>& blocks) {
     for (std::set<int64_t>::iterator it = blocks.begin(); it != blocks.end(); ++it) {
         MutexLock lock(&mu_);
-        DealWithDeadBlock(cs_id, *it);
+        DealWithDeadBlockInternal(cs_id, *it);
     }
     MutexLock lock(&mu_);
     NSBlock* block = NULL;
@@ -604,32 +619,68 @@ void BlockMapping::DealWithDeadNode(int32_t cs_id, const std::set<int64_t>& bloc
     lo_recover_check_.erase(cs_id);
 }
 
+void BlockMapping::DealWithDeadBlock(int32_t cs_id, int64_t block_id) {
+    MutexLock lock(&mu_);
+    DealWithDeadBlockInternal(cs_id, block_id);
+}
+
 void BlockMapping::PickRecoverBlocks(int32_t cs_id, int32_t block_num,
                                      std::vector<std::pair<int64_t, std::set<int32_t> > >* recover_blocks,
                                      RecoverPri pri) {
     MutexLock lock(&mu_);
-    if ((pri == kHigh && hi_pri_recover_.empty()) ||
-            (pri == kLow && lo_pri_recover_.empty())) {
+    if ((pri == kHigh && hi_pri_recover_.empty()) || (pri == kLow && lo_pri_recover_.empty())) {
         return;
     }
-    std::set<int64_t>& hi_check_set = hi_recover_check_[cs_id];
-    std::set<int64_t>& lo_check_set = lo_recover_check_[cs_id];
-    LOG(DEBUG, "C%d has %lu/%lu pending_recover blocks, quota=%d",
-        cs_id, hi_check_set.size(), lo_check_set.size(), block_num);
-    /*
-    int32_t quota = FLAGS_recover_speed - lo_check_set.size() - hi_check_set.size();
-    quota = quota < block_num ? quota : block_num;
-    */
-    std::set<int64_t>* target_set = NULL, *check_set = NULL;
-    if (pri == kHigh) {
-        target_set = &hi_pri_recover_;
-        check_set = &hi_check_set;
-    } else {
-        target_set = &lo_pri_recover_;
-        check_set = &lo_check_set;
+    std::set<int64_t>* target_set = pri == kHigh ? &hi_pri_recover_ : &lo_pri_recover_;
+    std::set<int64_t>* check_set =
+        pri == kHigh ? &hi_recover_check_[cs_id] : &lo_recover_check_[cs_id];
+    LOG(DEBUG, "Before Pick: C%d has %lu pending_recover blocks quota=%d pri=%s",
+            cs_id, check_set->size(), block_num, RecoverPri_Name(pri).c_str());
+
+    common::timer::TimeChecker pick_timer;
+    std::set<int64_t>::iterator it = target_set->begin();
+    // leave 3 seconds buffer
+    int32_t timeout = 3 + (pri == kHigh ? FLAGS_hi_recover_timeout : FLAGS_lo_recover_timeout);
+    while (static_cast<int>(recover_blocks->size()) < block_num && it != target_set->end()) {
+        NSBlock* cur_block = NULL;
+        if (!GetBlockPtr(*it, &cur_block)) { // block is removed
+            LOG(DEBUG, "PickRecoverBlocks for C%d can't find block: #%ld ", cs_id, *it);
+            target_set->erase(it++);
+            continue;
+        }
+        const std::set<int32_t>& replica = cur_block->replica;
+        int64_t block_id = cur_block->id;
+        if (replica.size() >= cur_block->expect_replica_num) {
+            LOG(DEBUG, "Replica num enough #%ld %lu", block_id, replica.size());
+            target_set->erase(it++);
+            SetState(cur_block, kNotInRecover);
+            continue;
+        }
+        if (replica.size() == 0) {
+            LOG(WARNING, "All Replica lost #%ld , give up recover.", block_id);
+            abort();
+            SetStateIf(cur_block, kAny, kLost);
+            lost_blocks_.insert(block_id);
+            target_set->erase(it++);
+            continue;
+        }
+        if (replica.find(cs_id) == replica.end()) {
+            ++it;
+            continue;
+        }
+        recover_blocks->push_back(std::make_pair(block_id, replica));
+        check_set->insert(block_id);
+        assert(cur_block->recover_stat == kHiRecover || cur_block->recover_stat == kLoRecover);
+        cur_block->recover_stat = kCheck;
+        LOG(INFO, "PickRecoverBlocks for C%d #%ld %s",
+                cs_id, block_id, RecoverStat_Name(cur_block->recover_stat).c_str());
+        thread_pool_->DelayTask(timeout * 1000,
+            boost::bind(&BlockMapping::CheckRecover, this, cs_id, block_id));
+        target_set->erase(it++);
     }
-    PickRecoverFromSet(cs_id, block_num, target_set, recover_blocks, check_set);
-    LOG(DEBUG, "After Pick: recover num(hi/lo): %ld/%ld ", hi_pri_recover_.size(), lo_pri_recover_.size());
+    pick_timer.Check(100 * 1000, "[PickRecoverBlocks] pick recover");
+    LOG(DEBUG, "After Pick: C%d has %u pending_recover blocks pri=%s",
+            cs_id, check_set->size(), RecoverPri_Name(pri).c_str());
     LOG(INFO, "C%d picked %lu blocks to recover", cs_id, recover_blocks->size());
 }
 
@@ -756,66 +807,26 @@ void BlockMapping::ListRecover(RecoverBlockSet* recover_blocks) {
     ListCheckList(incomplete_, &(recover_blocks->incomplete));
 }
 
-void BlockMapping::PickRecoverFromSet(int32_t cs_id, int32_t quota, std::set<int64_t>* recover_set,
-                                      std::vector<std::pair<int64_t, std::set<int32_t> > >* recover_blocks,
-                                      std::set<int64_t>* check_set) {
-    mu_.AssertHeld();
-    std::set<int64_t>::iterator it = recover_set->begin();
-    while (static_cast<int>(recover_blocks->size()) < quota && it != recover_set->end()) {
-        NSBlock* cur_block = NULL;
-        if (!GetBlockPtr(*it, &cur_block)) { // block is removed
-            LOG(DEBUG, "PickRecoverBlocks for C%d can't find block: #%ld ", cs_id, *it);
-            recover_set->erase(it++);
-            continue;
-        }
-        std::set<int32_t>& replica = cur_block->replica;
-        int64_t block_id = cur_block->id;
-        if (replica.size() >= cur_block->expect_replica_num) {
-            LOG(DEBUG, "Replica num enough #%ld %lu", block_id, replica.size());
-            recover_set->erase(it++);
-            SetState(cur_block, kNotInRecover);
-            continue;
-        }
-        if (replica.size() == 0) {
-            LOG(WARNING, "All Replica lost #%ld , give up recover.", block_id);
-            abort();
-            SetStateIf(cur_block, kAny, kLost);
-            lost_blocks_.insert(block_id);
-            recover_set->erase(it++);
-            continue;
-        }
-        if (replica.find(cs_id) == replica.end()) {
-            ++it;
-            continue;
-        }
-        recover_blocks->push_back(std::make_pair(block_id, replica));
-        check_set->insert(block_id);
-        assert(cur_block->recover_stat == kHiRecover || cur_block->recover_stat == kLoRecover);
-        cur_block->recover_stat = kCheck;
-        LOG(INFO, "PickRecoverBlocks for C%d #%ld %s",
-                cs_id, block_id, RecoverStat_Name(cur_block->recover_stat).c_str());
-        thread_pool_->DelayTask(FLAGS_recover_timeout * 1000,
-            boost::bind(&BlockMapping::CheckRecover, this, cs_id, block_id));
-        recover_set->erase(it++);
-    }
-}
-
 void BlockMapping::TryRecover(NSBlock* block) {
     mu_.AssertHeld();
-    if (safe_mode_
-        || block->recover_stat == kCheck
+    if (block->recover_stat == kCheck
         || block->recover_stat == kIncomplete
         || block->recover_stat == kBlockWriting) {
         return;
     }
     int64_t block_id = block->id;
     if (block->replica.size() < block->expect_replica_num) {
-        if (block->replica.size() == 0 && block->recover_stat != kLost) {
-            LOG(INFO, "[TryRecover] lost block #%ld ", block_id);
-            lost_blocks_.insert(block_id);
-            SetState(block, kLost);
-            lo_pri_recover_.erase(block_id);
-            hi_pri_recover_.erase(block_id);
+        if (block->replica.size() == 0) {
+            if (block->block_size && block->recover_stat != kLost) {
+                LOG(INFO, "[TryRecover] lost block #%ld ", block_id);
+                lost_blocks_.insert(block_id);
+                SetState(block, kLost);
+                lo_pri_recover_.erase(block_id);
+                hi_pri_recover_.erase(block_id);
+            } else if (block->block_size == 0 && block->recover_stat == kLost) {
+                lost_blocks_.erase(block_id);
+                LOG(WARNING, "[TryRecover] empty block #%ld remove from lost", block_id);
+            }
         } else if (block->replica.size() == 1 && block->recover_stat != kHiRecover) {
             hi_pri_recover_.insert(block_id);
             LOG(INFO, "[TryRecover] need more recover: #%ld %s->kHiRecover",

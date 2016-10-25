@@ -26,7 +26,6 @@
 #include <common/sliding_window.h>
 #include <common/string_util.h>
 #include "proto/nameserver.pb.h"
-#include "proto/status_code.pb.h"
 #include "rpc/nameserver_client.h"
 
 #include "chunkserver/counter_manager.h"
@@ -51,6 +50,7 @@ DECLARE_int32(chunkserver_recover_thread_num);
 DECLARE_int32(chunkserver_max_pending_buffers);
 DECLARE_int64(chunkserver_max_unfinished_bytes);
 DECLARE_bool(chunkserver_auto_clean);
+DECLARE_int32(block_report_timeout);
 
 namespace baidu {
 namespace bfs {
@@ -80,8 +80,13 @@ ChunkServerImpl::ChunkServerImpl()
      heartbeat_task_id_(-1),
      blockreport_task_id_(-1),
      last_report_blockid_(-1),
+     report_id_(0),
+     is_first_round_(true),
+     first_round_report_start_(-1),
      service_stop_(false) {
     data_server_addr_ = common::util::GetLocalHostName() + ":" + FLAGS_chunkserver_port;
+    params_.set_report_interval(FLAGS_blockreport_interval);
+    params_.set_report_size(FLAGS_blockreport_size);
     work_thread_pool_ = new ThreadPool(FLAGS_chunkserver_work_thread_num);
     read_thread_pool_ = new ThreadPool(FLAGS_chunkserver_read_thread_num);
     write_thread_pool_ = new ThreadPool(FLAGS_chunkserver_write_thread_num);
@@ -104,8 +109,8 @@ ChunkServerImpl::~ChunkServerImpl() {
     read_thread_pool_->Stop(true);
     write_thread_pool_->Stop(true);
     heartbeat_thread_->Stop(true);
-    delete rpc_client_;
     delete block_manager_;
+    delete rpc_client_;
     LogStatus(false);
     delete counter_manager_;
     delete recover_thread_pool_;
@@ -154,6 +159,12 @@ void ChunkServerImpl::Register() {
         work_thread_pool_->DelayTask(5000, boost::bind(&ChunkServerImpl::Register, this));
         return;
     }
+    if (response.report_interval() != -1) {
+        params_.set_report_interval(response.report_interval());
+    }
+    if (response.report_size() != -1) {
+        params_.set_report_size(response.report_size());
+    }
     int64_t new_version = response.namespace_version();
     if (block_manager_->NameSpaceVersion() != new_version) {
         // NameSpace change
@@ -174,8 +185,13 @@ void ChunkServerImpl::Register() {
     }
     assert (response.chunkserver_id() != -1);
     chunkserver_id_ = response.chunkserver_id();
-    LOG(INFO, "Connect to nameserver version= %ld, cs_id = C%d ",
-        block_manager_->NameSpaceVersion(), chunkserver_id_);
+    report_id_ = response.report_id() + 1;
+    first_round_report_start_ = last_report_blockid_;
+    is_first_round_ = true;
+    LOG(INFO, "Connect to nameserver version= %ld, cs_id = C%d report_interval = %d "
+            "report_size = %d report_id = %ld",
+            block_manager_->NameSpaceVersion(), chunkserver_id_,
+            params_.report_interval(), params_.report_size(), report_id_);
 
     work_thread_pool_->DelayTask(1, boost::bind(&ChunkServerImpl::SendBlockReport, this));
     heartbeat_thread_->DelayTask(1, boost::bind(&ChunkServerImpl::SendHeartbeat, this));
@@ -224,17 +240,39 @@ void ChunkServerImpl::SendHeartbeat() {
         kill(getpid(), SIGTERM);
         return;
     }
+    if (response.report_interval() != -1) {
+        params_.set_report_interval(response.report_interval());
+    }
+    if (response.report_size() != -1) {
+        params_.set_report_size(response.report_size());
+    }
     heartbeat_task_id_ = heartbeat_thread_->DelayTask(FLAGS_heartbeat_interval * 1000,
         boost::bind(&ChunkServerImpl::SendHeartbeat, this));
 }
 
 void ChunkServerImpl::SendBlockReport() {
     BlockReportRequest request;
+    request.set_sequence_id(common::timer::get_micros());
     request.set_chunkserver_id(chunkserver_id_);
     request.set_chunkserver_addr(data_server_addr_);
+    request.set_start(last_report_blockid_ + 1);
+    request.set_report_id(report_id_);
+    int64_t last_report_id = report_id_;
 
     std::vector<BlockMeta> blocks;
-    block_manager_->ListBlocks(&blocks, last_report_blockid_ + 1, FLAGS_blockreport_size);
+    int32_t num = is_first_round_ ? 10000 : params_.report_size();
+    int32_t end = block_manager_->ListBlocks(&blocks, last_report_blockid_ + 1, num);
+    // last id + 1 <= first found report start <= end -> first round ends
+    if (is_first_round_ &&
+        (last_report_blockid_ + 1) <= first_round_report_start_ &&
+        first_round_report_start_ <= end) {
+        is_first_round_ = false;
+        LOG(INFO, "First round report done");
+    }
+    // bugfix, need an elegant implementation T_T
+    if (is_first_round_ && first_round_report_start_ == -1) {
+        first_round_report_start_ = 0;
+    }
 
     int64_t blocks_num = blocks.size();
     for (int64_t i = 0; i < blocks_num; i++) {
@@ -244,31 +282,30 @@ void ChunkServerImpl::SendBlockReport() {
         info->set_version(blocks[i].version());
     }
 
-    if (blocks_num < FLAGS_blockreport_size) {
+    if (blocks_num < num) {
         last_report_blockid_ = -1;
     } else {
-        if (blocks_num) {
-            last_report_blockid_ = blocks[blocks_num - 1].block_id();
-        }
+        last_report_blockid_ = end;
     }
+    request.set_end(end);
 
     BlockReportResponse response;
-    int64_t before_report = common::timer::get_micros();
-    bool ret = nameserver_->SendRequest(&NameServer_Stub::BlockReport, &request, &response, 600);
-    int64_t after_report = common::timer::get_micros();
-    if (after_report - before_report > 20 * 1000 * 1000) {
-        LOG(WARNING, "Block report use %ld ms", (after_report - before_report) / 1000);
-    }
+    common::timer::TimeChecker checker;
+    bool ret = nameserver_->SendRequest(&NameServer_Stub::BlockReport,
+                                        &request, &response, FLAGS_block_report_timeout);
+    checker.Check(20 * 1000 * 1000, "[SendBlockReport] SendRequest");
     if (!ret) {
-        LOG(WARNING, "Block reprot fail\n");
+        LOG(WARNING, "Block report fail last_id %lu (%lu)\n", last_report_id, request.sequence_id());
     } else {
         if (response.status() != kOK) {
             last_report_blockid_ = -1;
+            report_id_ = 0;
             LOG(WARNING, "BlockReport return %s, Pause to report", StatusCode_Name(response.status()).c_str());
             return;
         }
         //LOG(INFO, "Report return old: %d new: %d", chunkserver_id_, response.chunkserver_id());
         //deal with obsolete blocks
+        report_id_ = response.report_id() + 1;
         std::vector<int64_t> obsolete_blocks;
         for (int i = 0; i < response.obsolete_blocks_size(); i++) {
             obsolete_blocks.push_back(response.obsolete_blocks(i));
@@ -280,7 +317,8 @@ void ChunkServerImpl::SendBlockReport() {
             write_thread_pool_->AddTask(task);
         }
 
-        LOG(INFO, "Block report done. %d replica blocks", response.new_replicas_size());
+        LOG(INFO, "Block report (%lu) done. %d replica blocks last_id %ld next_id %ld",
+                request.sequence_id(), response.new_replicas_size(), last_report_id, report_id_);
         g_recover_count.Add(response.new_replicas_size());
         for (int i = 0; i < response.new_replicas_size(); ++i) {
             const ReplicaInfo& rep = response.new_replicas(i);
@@ -301,7 +339,7 @@ void ChunkServerImpl::SendBlockReport() {
             write_thread_pool_->AddTask(close_block_task);
         }
     }
-    blockreport_task_id_ = work_thread_pool_->DelayTask(FLAGS_blockreport_interval* 1000,
+    blockreport_task_id_ = work_thread_pool_->DelayTask(params_.report_interval() * 1000,
         boost::bind(&ChunkServerImpl::SendBlockReport, this));
 }
 
@@ -314,6 +352,7 @@ bool ChunkServerImpl::ReportFinish(Block* block) {
     info->set_block_id(block->Id());
     info->set_block_size(block->Size());
     info->set_version(block->GetVersion());
+    info->set_is_recover(block->IsRecover());
     BlockReceivedResponse response;
     if (!nameserver_->SendRequest(&NameServer_Stub::BlockReceived, &request, &response, 20)) {
         LOG(WARNING, "Reprot finish fail: #%ld ", block->Id());
@@ -438,7 +477,11 @@ void ChunkServerImpl::WriteNextCallback(const WriteBlockRequest* next_request,
                      "status= %s, error= %d\n",
             next_server.c_str(), block_id, packet_seq, offset, databuf.size(),
             StatusCode_Name(next_response->status()).c_str(), error);
-        response->set_status(kWriteError);
+        if (failed) {
+            response->set_status(kNetworkUnavailable);
+        } else {
+            response->set_status(next_response->status());
+        }
         delete next_response;
         g_unfinished_bytes.Sub(databuf.size());
         done->Run();

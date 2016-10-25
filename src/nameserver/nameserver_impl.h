@@ -26,6 +26,19 @@ class ChunkServerManager;
 class BlockMappingManager;
 class Sync;
 
+enum RecoverMode {
+    kStopRecover = 0,
+    kHiOnly = 1,
+    kRecoverAll = 2,
+};
+
+enum DisplayMode {
+    kDisplayAll = 0,
+    kAliveOnly = 1,
+    kDeadOnly = 2,
+    kOverload = 3,
+};
+
 class NameServerImpl : public NameServer {
 public:
     NameServerImpl(Sync* sync);
@@ -118,8 +131,8 @@ private:
     void RebuildBlockMapCallback(const FileInfo& file_info);
     void LogStatus();
     void Register();
-    void CheckSafemode();
-    void LeaveSafemode();
+    void CheckRecoverMode();
+    void LeaveReadOnly();
     void ListRecover(sofa::pbrpc::HTTPResponse* response);
     bool LogRemote(const NameServerLog& log, boost::function<void (bool)> callback);
     void SyncLogCallback(::google::protobuf::RpcController* controller,
@@ -136,8 +149,12 @@ private:
                     const ::google::protobuf::Message* request,
                     ::google::protobuf::Message* response,
                     ::google::protobuf::Closure* done);
+    bool CheckFileHasBlock(const FileInfo& file_info,
+                           const std::string& file_name,
+                           int64_t block_id);
 private:
     /// Global thread pool
+    ThreadPool* read_thread_pool_;
     ThreadPool* work_thread_pool_;
     ThreadPool* report_thread_pool_;
     ThreadPool* heartbeat_thread_pool_;
@@ -145,9 +162,10 @@ private:
     ChunkServerManager* chunkserver_manager_;
     /// Block map
     BlockMappingManager* block_mapping_manager_;
-    /// Safemode
-    volatile int safe_mode_;
-    volatile int start_recover_;
+
+    volatile bool readonly_;
+    volatile int recover_timeout_;
+    RecoverMode recover_mode_;
     int64_t start_time_;
     /// Namespace
     NameSpace* namespace_;

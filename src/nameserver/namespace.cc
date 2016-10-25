@@ -24,6 +24,7 @@ DECLARE_string(namedb_path);
 DECLARE_int64(namedb_cache_size);
 DECLARE_int32(default_replica_num);
 DECLARE_int32(block_id_allocation_size);
+DECLARE_bool(check_orphan);
 
 const int64_t kRootEntryid = 1;
 
@@ -91,8 +92,20 @@ void NameSpace::EncodingStoreKey(int64_t entry_id,
                                  const std::string& path,
                                  std::string* key_str) {
     key_str->resize(8);
-    common::util::EncodeBigEndian(&(*key_str)[0], entry_id);
+    common::util::EncodeBigEndian(&(*key_str)[0], (uint64_t)entry_id);
     key_str->append(path);
+}
+
+void NameSpace::DecodingStoreKey(const std::string& key_str,
+                                 int64_t* entry_id,
+                                 std::string* path) {
+    assert(key_str.size() >= 8UL);
+    if (entry_id) {
+        *entry_id = common::util::DecodeBigEndian64(key_str.c_str());
+    }
+    if (path) {
+        path->assign(key_str, 8, std::string::npos);
+    }
 }
 
 bool NameSpace::GetFromStore(const std::string& key, FileInfo* info) {
@@ -238,6 +251,10 @@ StatusCode NameSpace::CreateFile(const std::string& path, int flags, int mode, i
             LOG(INFO, "CreateFile %s fail: already exist!", fname.c_str());
             return kFileExists;
         } else {
+            if (IsDir(file_info.type())) {
+                LOG(INFO, "CreateFile %s fail: directory with same name exist", fname.c_str());
+                return kFileExists;
+            }
             for (int i = 0; i < file_info.blocks_size(); i++) {
                 blocks_to_remove->push_back(file_info.blocks(i));
             }
@@ -268,6 +285,14 @@ StatusCode NameSpace::ListDirectory(const std::string& path,
     FileInfo info;
     if (!LookUp(path, &info)) {
         return kNsNotFound;
+    }
+    if (!IsDir(info.type())) {
+        FileInfo* file_info = outputs->Add();
+        file_info->CopyFrom(info);
+        //for a file, name should be empty because it's a relative path
+        file_info->clear_name();
+        LOG(INFO, "List %s return %ld items", path.c_str(), outputs->size());
+        return kOK;
     }
     int64_t entry_id = info.entry_id();
     LOG(DEBUG, "ListDirectory entry_id= E%ld ", entry_id);
@@ -535,14 +560,16 @@ StatusCode NameSpace::InternalDeleteDirectory(const FileInfo& dir_info,
 bool NameSpace::RebuildBlockMap(boost::function<void (const FileInfo&)> callback) {
     int64_t block_num = 0;
     int64_t file_num = 0;
+    std::set<int64_t> entry_id_set;
+    entry_id_set.insert(root_path_.entry_id());
     leveldb::Iterator* it = db_->NewIterator(leveldb::ReadOptions());
     for (it->Seek(std::string(7, '\0') + '\1'); it->Valid(); it->Next()) {
         FileInfo file_info;
         bool ret = file_info.ParseFromArray(it->value().data(), it->value().size());
+        assert(ret);
         if (last_entry_id_ < file_info.entry_id()) {
             last_entry_id_ = file_info.entry_id();
         }
-        assert(ret);
         if (!IsDir(file_info.type())) {
             //a file
             for (int i = 0; i < file_info.blocks_size(); i++) {
@@ -556,11 +583,32 @@ bool NameSpace::RebuildBlockMap(boost::function<void (const FileInfo&)> callback
             if (!callback.empty()) {
                 callback(file_info);
             }
+        } else {
+            entry_id_set.insert(file_info.entry_id());
         }
     }
+    LOG(INFO, "RebuildBlockMap done. %ld directories, %ld files, "
+              "%lu blocks, last_entry_id= E%ld",
+        entry_id_set.size(), file_num, block_num, last_entry_id_);
+    if (FLAGS_check_orphan) {
+        std::vector<std::pair<std::string, std::string> > orphan_entrys;
+        for (it->Seek(std::string(7, '\0') + '\1'); it->Valid(); it->Next()) {
+            FileInfo file_info;
+            bool ret = file_info.ParseFromArray(it->value().data(), it->value().size());
+            assert(ret);
+            int64_t parent_entry_id = 0;
+            std::string filename;
+            DecodingStoreKey(it->key().ToString(), &parent_entry_id, &filename);
+            if (entry_id_set.find(parent_entry_id) == entry_id_set.end()) {
+                LOG(WARNING, "Orphan entry PE%ld E%ld %s",
+                    parent_entry_id, file_info.entry_id(), filename.c_str());
+                orphan_entrys.push_back(std::make_pair(it->key().ToString(),
+                                                       it->value().ToString()));
+            }
+        }
+        LOG(INFO, "Check orphan done, %lu entries", orphan_entrys.size());
+    }
     delete it;
-    LOG(INFO, "RebuildBlockMap done. %ld files, %ld blocks, last_entry_id= E%ld",
-        file_num, block_num, last_entry_id_);
     return true;
 }
 
